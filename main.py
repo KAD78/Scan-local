@@ -1,91 +1,119 @@
 #!/usr/bin/env python3
-import asyncio, ipaddress
+import asyncio
+import ipaddress
+import json
+import ssl
+import sys
+from datetime import datetime
 
 # ===== CONFIG =====
-TIMEOUT = 1
-MAX_CONCURRENT = 800
+TIMEOUT = 2
+MAX_CONCURRENT = 150
+RETRIES = 2
+OUTPUT_FILE = "scan_results.json"
 
 COMMON_PORTS = [
     21,22,23,25,53,80,110,143,443,
     554,8080,8000,8443,3306,3389
 ]
 
+# ===== SSL CONTEXT =====
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
 # ===== DETECTION =====
 def detect_service(port, banner):
-    banner = banner.lower()
+    b = banner.lower()
 
     if port == 554:
-        return "📷 IP Camera (RTSP)"
-    if "nginx" in banner:
-        return "🌐 nginx"
-    if "apache" in banner:
-        return "🌐 apache"
-    if "ssh" in banner:
-        return "🔐 ssh"
-    if "ftp" in banner:
-        return "📁 ftp"
-    if "http" in banner:
-        return "🌐 http"
+        return "RTSP Camera"
+    if "ssh" in b:
+        return "SSH"
+    if "ftp" in b:
+        return "FTP"
+    if "smtp" in b:
+        return "SMTP"
+    if "mysql" in b:
+        return "MySQL"
+    if "rdp" in b:
+        return "RDP"
+    if "nginx" in b:
+        return "nginx"
+    if "apache" in b:
+        return "apache"
+    if "http" in b:
+        return "HTTP"
     if port == 443:
-        return "🔒 https"
-    if port == 3389:
-        return "🖥️ rdp"
+        return "HTTPS"
+    return "Unknown"
 
-    return "❓ unknown"
-
-# ===== SCAN PORT =====
+# ===== PORT SCAN =====
 async def scan_port(ip, port):
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=TIMEOUT
-        )
-
-        banner = ""
-
-        # HTTP
-        if port in [80, 8080, 8000]:
-            writer.write(b"GET / HTTP/1.0\r\n\r\n")
-            await writer.drain()
-
-        # RTSP (camera)
-        if port == 554:
-            writer.write(b"OPTIONS rtsp://test RTSP/1.0\r\n\r\n")
-            await writer.drain()
-
+    for _ in range(RETRIES):
         try:
-            data = await asyncio.wait_for(reader.read(1024), timeout=TIMEOUT)
-            if data:
-                banner = data.decode(errors="ignore").strip().split("\n")[0][:120]
-        except:
-            pass
+            if port in [443, 8443]:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port, ssl=SSL_CTX), timeout=TIMEOUT
+                )
+            else:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, port), timeout=TIMEOUT
+                )
 
-        writer.close()
-        await writer.wait_closed()
+            banner = ""
 
-        return (ip, port, banner)
+            if port in [80, 8080, 8000, 8443, 443]:
+                writer.write(b"HEAD / HTTP/1.0\r\n\r\n")
+                await writer.drain()
 
-    except:
-        return None
+            if port == 554:
+                writer.write(b"OPTIONS rtsp://test RTSP/1.0\r\n\r\n")
+                await writer.drain()
 
-# ===== EXPAND IP =====
+            try:
+                data = await asyncio.wait_for(reader.read(1024), timeout=TIMEOUT)
+                if data:
+                    banner = data.decode(errors="ignore").strip().split("\n")[0][:200]
+            except asyncio.TimeoutError:
+                pass
+
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except:
+                pass
+
+            return (ip, port, banner)
+
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+            continue
+    return None
+
+# ===== TARGET EXPANSION =====
 def expand_targets(target):
     try:
         if "/" not in target:
             target += "/32"
         net = ipaddress.ip_network(target, strict=False)
         return [str(ip) for ip in net.hosts()]
-    except:
-        return [target]
+    except Exception:
+        return []
 
-# ===== SCAN NETWORK =====
+# ===== SCAN =====
 async def scan_network(target):
     ips = expand_targets(target)
-    results = []
+
+    if not ips:
+        print("[!] Invalid target format")
+        return []
 
     sem = asyncio.Semaphore(MAX_CONCURRENT)
+    results = []
 
     async def worker(ip, port):
         async with sem:
+            await asyncio.sleep(0.001)
             return await scan_port(ip, port)
 
     tasks = [
@@ -95,10 +123,13 @@ async def scan_network(target):
     ]
 
     for task in asyncio.as_completed(tasks):
-        res = await task
-        if res:
-            results.append(res)
-            print_result(res)
+        try:
+            res = await task
+            if res:
+                results.append(res)
+                print_result(res)
+        except Exception:
+            pass
 
     return results
 
@@ -110,53 +141,102 @@ def print_result(res):
     print(f"[+] {ip}:{port} → {service}")
 
     if banner:
-        print(f"    └─ {banner}")
+        print(f"    ├─ Banner: {banner}")
 
-# ===== HTTP TEST =====
-async def test_http(ip):
+# ===== HTTP ANALYSIS =====
+async def analyze_http(ip):
     import aiohttp
 
-    paths = ["/", "/login", "/admin", "/web", "/camera"]
+    timeout = aiohttp.ClientTimeout(total=5)
+    connector = aiohttp.TCPConnector(ssl=False, limit=50)
 
-    async with aiohttp.ClientSession() as session:
-        for path in paths:
-            url = f"http://{ip}{path}"
-            try:
-                async with session.get(url, timeout=3) as r:
-                    if r.status == 200:
-                        print(f"[WEB] {url} → OK (200)")
-            except:
-                pass
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        for path in ["/", "/admin", "/login"]:
+            for proto in ["http", "https"]:
+                url = f"{proto}://{ip}{path}"
+                try:
+                    async with session.get(url) as r:
+                        print(f"[WEB] {url} → {r.status}")
+                except Exception:
+                    pass
+
+# ===== SAVE =====
+def save_results(results):
+    with open(OUTPUT_FILE, "w") as f:
+        json.dump([
+            {
+                "ip": ip,
+                "port": port,
+                "service": detect_service(port, banner),
+                "banner": banner
+            }
+            for ip, port, banner in results
+        ], f, indent=4)
+
+    print(f"\nResults saved to {OUTPUT_FILE}")
+
+# ===== SUMMARY =====
+def summary(results):
+    print("\n===== SCAN SUMMARY =====")
+    stats = {}
+
+    for ip, port, banner in results:
+        service = detect_service(port, banner)
+        stats[service] = stats.get(service, 0) + 1
+
+    for k, v in stats.items():
+        print(f"{k}: {v}")
 
 # ===== MAIN =====
 def main():
-    print("\n=== 🔥 Network Scanner PRO MAX ===\n")
+    print("\n=== NETWORK SCANNER PRO+++ FIXED ===\n")
 
-    target = input("Target (ex: 192.168.1.0/24): ").strip()
+    # 🔥 SUPPORT ARGUMENT (no input bug anymore)
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+        print(f"[+] Target from CLI: {target}")
+    else:
+        try:
+            target = input("Target: ").strip()
+        except Exception:
+            target = ""
 
-    print("\n[+] Ultra fast scanning...\n")
+    if not target:
+        print("[!] No target provided")
+        print("👉 Usage: python main.py 192.168.1.0/24")
+        return
+
+    start = datetime.now()
+
+    print("\n[+] Scanning...\n")
     results = asyncio.run(scan_network(target))
 
     if not results:
-        print("\n[-] Aucun port ouvert trouvé.")
+        print("[-] No open ports found")
         return
 
-    # Unique IPs
     ips = list(set([r[0] for r in results]))
 
-    # HTTP test
-    choice = input("\nRun web detection? (y/n): ")
+    choice = "n"
+    try:
+        choice = input("\nRun deep web scan? (y/n): ")
+    except:
+        pass
 
     if choice.lower() == "y":
-        print("\n[+] Testing web interfaces...\n")
+        print("\n[+] Web scanning...\n")
 
-        async def run_tests():
-            await asyncio.gather(*(test_http(ip) for ip in ips))
+        async def run():
+            await asyncio.gather(*(analyze_http(ip) for ip in ips))
 
-        asyncio.run(run_tests())
+        asyncio.run(run())
 
-    print("\n✅ Scan terminé.\n")
+    save_results(results)
+    summary(results)
 
-# ===== RUN =====
+    end = datetime.now()
+    print(f"\nDuration: {end - start}")
+    print("\nScan complete\n")
+
 if __name__ == "__main__":
     main()
